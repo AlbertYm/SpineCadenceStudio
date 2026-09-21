@@ -1,0 +1,7 @@
+dist/
+*.spine
+*.zip
+*.log
+.vs/
+bin/
+obj/

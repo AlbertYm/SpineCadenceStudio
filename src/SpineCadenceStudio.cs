@@ -1,0 +1,135 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Windows.Forms;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
+using System.Security.Cryptography;
+using System.Reflection;
+[assembly: AssemblyVersion("1.0.3.0")]
+[assembly: AssemblyFileVersion("1.0.3.0")]
+namespace SpineCadence {
+static class Engine {
+ public const string Version="1.0.3";
+ static double[] DecodeColor(string hex,int count){Check(hex!=null&&hex.Length==count*2,"颜色格式错误。");return Enumerable.Range(0,count).Select(i=>Convert.ToInt32(hex.Substring(i*2,2),16)/255.0).ToArray();}
+ static string EncodeColor(IEnumerable<double> values){return string.Concat(values.Select(v=>((int)Math.Round(Math.Max(0,Math.Min(1,v))*255,MidpointRounding.AwayFromZero)).ToString("x2")));}
+ static double[] ColorValues(Dictionary<string,object> key,string type){if(type=="alpha")return new[]{Num(key,"value")};bool two=type.EndsWith("2");int n=type.StartsWith("rgba")?4:3;var light=DecodeColor(Convert.ToString(key[two?"light":"color"]),n);return two?light.Concat(DecodeColor(Convert.ToString(key["dark"]),3)).ToArray():light;}
+ static object[] SampleColors(Dictionary<string,object>[] keys,string type,Dictionary<string,object> slot,List<double> times){
+  int lightCount=type.StartsWith("rgba")?4:3;bool two=type.EndsWith("2");var setupLight=DecodeColor(slot.ContainsKey("color")?Convert.ToString(slot["color"]):"ffffffff",4);var setup=type=="alpha"?new[]{setupLight[3]}:setupLight.Take(lightCount).ToArray();if(two)setup=setup.Concat(DecodeColor(slot.ContainsKey("dark")?Convert.ToString(slot["dark"]):"000000",3)).ToArray();
+  var values=keys.Select(k=>ColorValues(k,type)).ToArray();
+  for(int i=0;i<keys.Length;i++){if(i>0)Check(Num(keys[i],"time")>Num(keys[i-1],"time"),"颜色关键帧时间未严格递增。");if(!keys[i].ContainsKey("curve")||Convert.ToString(keys[i]["curve"])=="stepped")continue;var curve=keys[i]["curve"] as object[];Check(curve!=null&&curve.Length==setup.Length*4,"颜色曲线控制点格式错误。");foreach(var point in curve){double v=Convert.ToDouble(point);Check(!double.IsNaN(v)&&!double.IsInfinity(v),"颜色曲线包含非有限数值。");}if(i+1<keys.Length)for(int axis=0;axis<setup.Length;axis++){double a=Convert.ToDouble(curve[axis*4]),b=Convert.ToDouble(curve[axis*4+2]);Check(a>=Num(keys[i],"time")-0.001&&b<=Num(keys[i+1],"time")+0.001&&a<=b,"颜色曲线时间控制点顺序异常。");}}
+  return times.Select(t=>{int i=Array.FindLastIndex(keys,k=>Num(k,"time")<=t+1e-9);var value=(double[])(i<0?setup:values[i]).Clone();if(i>=0&&i+1<keys.Length){for(int axis=0;axis<value.Length;axis++){if(!keys[i].ContainsKey("curve"))value[axis]+=(values[i+1][axis]-value[axis])*(t-Num(keys[i],"time"))/(Num(keys[i+1],"time")-Num(keys[i],"time"));else if(keys[i]["curve"] is object[])value[axis]=CurveValue(t,Num(keys[i],"time"),value[axis],Num(keys[i+1],"time"),values[i+1][axis],(object[])keys[i]["curve"],axis);}}var frame=Key(t);frame["curve"]="stepped";if(type=="alpha")frame["value"]=Math.Max(0,Math.Min(1,value[0]));else {frame[two?"light":"color"]=EncodeColor(value.Take(lightCount));if(two)frame["dark"]=EncodeColor(value.Skip(lightCount));}return (object)frame;}).ToArray();
+ }
+ // Spine 4.1 evaluates each value's absolute-time Bezier as ten linear segments.
+ public static double CurveValue(double time,double t0,double v0,double t1,double v1,object[] controls,int axis){
+  int offset=axis*4;double cx1=Convert.ToDouble(controls[offset]),cy1=Convert.ToDouble(controls[offset+1]),cx2=Convert.ToDouble(controls[offset+2]),cy2=Convert.ToDouble(controls[offset+3]);
+  double px=t0,py=v0;
+  for(int i=1;i<=10;i++){double u=i/10.0,w=1-u;double x=i==10?t1:w*w*w*t0+3*w*w*u*cx1+3*w*u*u*cx2+u*u*u*t1;double y=i==10?v1:w*w*w*v0+3*w*w*u*cy1+3*w*u*u*cy2+u*u*u*v1;if(time<=x||i==10)return x==px?y:py+(y-py)*(time-px)/(x-px);px=x;py=y;}return v1;
+ }
+ public static JavaScriptSerializer Json(){return new JavaScriptSerializer{MaxJsonLength=int.MaxValue,RecursionLimit=300};}
+ public static Dictionary<string,object> Map(object o){return (Dictionary<string,object>)o;}
+ static double Num(Dictionary<string,object> o,string key,double def=0){return o.ContainsKey(key)?Convert.ToDouble(o[key]):def;}
+ static object[] Arr(object o){return ((IEnumerable)o).Cast<object>().ToArray();}
+ static double Duration(object o){var d=o as Dictionary<string,object>;if(d!=null)return Math.Max(Num(d,"time"),d.Values.Select(Duration).DefaultIfEmpty(0).Max());var a=o as object[];return a==null?0:a.Select(Duration).DefaultIfEmpty(0).Max();}
+ static string Hash(string p){using(var s=File.OpenRead(p))using(var h=SHA256.Create())return BitConverter.ToString(h.ComputeHash(s));}
+ public static string Run(string exe,string args){var p=new Process{StartInfo=new ProcessStartInfo(exe,args){UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true}};p.Start();var a=p.StandardOutput.ReadToEndAsync();var b=p.StandardError.ReadToEndAsync();if(!p.WaitForExit(180000)){p.Kill();p.WaitForExit();throw new Exception("Spine 超过 180 秒未完成，已停止本次子进程。");}Task.WaitAll(a,b);if(p.ExitCode!=0)throw new Exception("Spine 执行失败。请确认版本 4.1.24 已安装并激活。退出码 "+p.ExitCode);return a.Result+b.Result;}
+ static string Q(string s){return "\""+s+"\"";}
+ static string Cli(string input,string output,string operation){return "--hide-license -u 4.1.24 -i "+Q(input)+" -o "+Q(output)+" "+operation;}
+ static void Check(bool ok,string message){if(!ok)throw new Exception(message);}
+ static Dictionary<string,object> Key(double time){return new Dictionary<string,object>{{"time",time}};}
+ static void VerifyAnimation(object expected,object actual,string path){
+  var d=expected as Dictionary<string,object>;if(d!=null){var a=actual as Dictionary<string,object>;Check(a!=null,"回读结构不一致："+path);foreach(var pair in d){if(pair.Key=="curve"&&!a.ContainsKey(pair.Key))continue;object value;if(!a.TryGetValue(pair.Key,out value)){if(pair.Value==null)continue;if(pair.Value is double||pair.Value is int||pair.Value is decimal){double def=pair.Key!="time"&&path.Contains("/scale")?1:0;Check(Math.Abs(Convert.ToDouble(pair.Value)-def)<0.0051,"回读缺失数值："+path+"/"+pair.Key);continue;}if(pair.Value is object[]&&((object[])pair.Value).Length==0)continue;throw new Exception("回读缺失字段："+path+"/"+pair.Key);}VerifyAnimation(pair.Value,value,path+"/"+pair.Key);}return;}
+  var arr=expected as object[];if(arr!=null){Check(actual is object[],"回读数组不一致："+path);var a=(object[])actual;Check(arr.Length==a.Length,"回读关键帧数量不一致："+path);for(int i=0;i<arr.Length;i++){var frame=arr[i] as Dictionary<string,object>;if(i<arr.Length-1&&frame!=null&&frame.ContainsKey("curve")&&Convert.ToString(frame["curve"])=="stepped")Check(Map(a[i]).ContainsKey("curve")&&Convert.ToString(Map(a[i])["curve"])=="stepped","回读后保持式曲线丢失："+path);VerifyAnimation(arr[i],a[i],path+"/"+i);}return;}
+  if(expected==null){Check(actual==null,"回读空值不一致："+path);return;}if(expected is double||expected is decimal||expected is int){Check(actual!=null&&Math.Abs(Convert.ToDouble(expected)-Convert.ToDouble(actual))< (path.EndsWith("/time")?0.00011:0.0051),"回读数值不一致："+path);return;}Check(Convert.ToString(expected)==Convert.ToString(actual),"回读内容不一致："+path);
+ }
+ public static Dictionary<string,object> ConvertData(Dictionary<string,object> data,int fps){
+  var skeleton=Map(data["skeleton"]);Check(Convert.ToString(skeleton["spine"]).StartsWith("4.1."),"仅支持 Spine 4.1 数据。");
+  if(data.ContainsKey("events"))foreach(var definition in Map(data["events"]).Values)Check(!Map(definition).ContainsKey("audio"),"暂不支持带音频文件的事件，请保留原工程使用。");
+  var animations=Map(data["animations"]);
+  foreach(var entry in animations){var anim=Map(entry.Value);double end=Duration(anim);Check(end*fps<200000,"动画过长，采样点超过安全上限。");var times=new List<double>();for(int i=0;i<Math.Ceiling(end*fps);i++)if(i/(double)fps<end)times.Add(i/(double)fps);times.Add(end);
+   foreach(var group in anim.Keys.ToArray()){
+    Check(group=="bones"||group=="slots"||group=="events"||group=="drawOrder","不支持的动画通道："+group+"；未生成工程。");
+    if(group=="events")continue;
+    if(group=="drawOrder"){var old=Arr(anim[group]);anim[group]=times.Select(t=>{var last=old.Select(Map).LastOrDefault(frame=>Num(frame,"time")<=t+1e-9);var k=last==null?Key(t):new Dictionary<string,object>(last);k["time"]=t;return (object)k;}).ToArray();continue;}
+    foreach(var target in Map(anim[group])){var channels=Map(target.Value);foreach(var type in channels.Keys.ToArray()){
+     var keys=Arr(channels[type]).Select(Map).ToArray();Check(keys.Length>0,"存在空动画通道："+target.Key+" / "+type);
+     if(group=="slots"){
+      if(type=="attachment") {var slot=Arr(data["slots"]).Select(Map).First(s=>Convert.ToString(s["name"])==target.Key);object setup=slot.ContainsKey("attachment")?slot["attachment"]:null;channels[type]=times.Select(t=>{var last=keys.LastOrDefault(frame=>Num(frame,"time")<=t+1e-9);var k=Key(t);k["name"]=last==null?setup:last.ContainsKey("name")?last["name"]:null;return (object)k;}).ToArray();continue;}
+      Check(new[]{"rgba","rgb","alpha","rgba2","rgb2"}.Contains(type),"不支持的插槽通道："+target.Key+" / "+type);if(keys.Length==1&&Num(keys[0],"time")==0)continue;var colorSlot=Arr(data["slots"]).Select(Map).First(s=>Convert.ToString(s["name"])==target.Key);channels[type]=SampleColors(keys,type,colorSlot,times);continue;
+     }
+     Check(new[]{"translate","scale","rotate","shear","translatex","translatey","scalex","scaley","shearx","sheary"}.Contains(type),"不支持的骨骼通道："+type);
+     string[] fields=type=="rotate"?new[]{"value"}:(type.EndsWith("x")||type.EndsWith("y"))?new[]{"value"}:new[]{"x","y"};double def=type.StartsWith("scale")?1:0;
+     for(int j=0;j<keys.Length;j++){var key=keys[j];if(j>0)Check(Num(key,"time")>Num(keys[j-1],"time"),"关键帧时间未严格递增。");if(!key.ContainsKey("curve")||Convert.ToString(key["curve"])=="stepped")continue;var curve=key["curve"] as object[];Check(curve!=null&&curve.Length==fields.Length*4,"曲线控制点格式错误："+target.Key+" / "+type);foreach(var point in curve){double n=Convert.ToDouble(point);Check(!double.IsNaN(n)&&!double.IsInfinity(n),"曲线包含非有限数值。");}if(j+1<keys.Length)for(int axis=0;axis<fields.Length;axis++){double left=Convert.ToDouble(curve[axis*4]),right=Convert.ToDouble(curve[axis*4+2]);Check(left>=Num(key,"time")-0.001&&right<=Num(keys[j+1],"time")+0.001&&left<=right,"曲线时间控制点顺序异常。");}}
+     channels[type]=times.Select(t=>{var k=Key(t);k["curve"]="stepped";int index=Array.FindLastIndex(keys,a=>Num(a,"time")<=t+1e-9);for(int axis=0;axis<fields.Length;axis++){string f=fields[axis];double v=def;if(index>=0){var a=keys[index];v=Num(a,f,def);if(index+1<keys.Length){var b=keys[index+1];if(!a.ContainsKey("curve"))v+=(Num(b,f,def)-v)*(t-Num(a,"time"))/(Num(b,"time")-Num(a,"time"));else if(a["curve"] is object[])v=CurveValue(t,Num(a,"time"),v,Num(b,"time"),Num(b,f,def),(object[])a["curve"],axis);}}k[f]=v;}return (object)k;}).ToArray();
+    }}
+   }
+   Check(Math.Abs(Duration(anim)-end)<1e-8,"转换后时长不一致。");
+  }
+  return data;
+ }
+ static void CopyImages(Dictionary<string,object> data,string folder,string output){
+  Check(Directory.Exists(folder),"找不到贴图目录："+folder);Directory.CreateDirectory(output);var copied=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+  foreach(var skin in Arr(data["skins"]).Select(Map)){if(!skin.ContainsKey("attachments"))continue;foreach(var slot in Map(skin["attachments"]).Values)foreach(var attachment in Map(slot)){
+   var a=Map(attachment.Value);Check(!a.ContainsKey("sequence"),"暂不支持序列附件。");string type=a.ContainsKey("type")?Convert.ToString(a["type"]):"region";if(!new[]{"region","mesh","linkedmesh"}.Contains(type))continue;
+   string rel=(a.ContainsKey("path")?Convert.ToString(a["path"]):attachment.Key).Replace('/',Path.DirectorySeparatorChar);Check(!Path.IsPathRooted(rel)&&!rel.Split(Path.DirectorySeparatorChar).Contains(".."),"贴图路径超出资源目录："+rel);string source=Path.Combine(folder,rel+".png");Check(File.Exists(source),"找不到贴图："+source);if(!copied.Add(rel))continue;string dest=Path.Combine(output,rel+".png");Directory.CreateDirectory(Path.GetDirectoryName(dest));File.Copy(source,dest,false);
+  }}
+ }
+ public static string ConvertFile(string input,string outputRoot,int fps,string exe,Action<string> status){
+  Check(File.Exists(input),"输入文件不存在。");Check(File.Exists(exe),"找不到 Spine.com，请选择已安装的 Spine.com。");Check(fps>=1&&fps<=120,"FPS 必须在 1 到 120 之间。");
+  string before=Hash(input), scratch=Path.Combine(Path.GetTempPath(),"SpineCadence_"+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(scratch);
+  string export=Path.Combine(scratch,"export"),root=string.IsNullOrWhiteSpace(outputRoot)?Path.GetDirectoryName(input):Path.GetFullPath(outputRoot);Directory.CreateDirectory(export);Directory.CreateDirectory(root);
+  string originalName=Path.GetFileNameWithoutExtension(input),stem=originalName+"_"+fps+"fps",target=Path.Combine(root,stem);int suffix=2;while(Directory.Exists(target)||File.Exists(target))target=Path.Combine(root,stem+"_"+suffix++);
+  string stage=Path.Combine(root,".SpineCadence_"+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(stage);
+  try{status("读取工程");Run(exe,Cli(input,export,"-e json"));var jsons=Directory.GetFiles(export,"*.json");Check(jsons.Length==1,"当前版本仅支持单骨架工程，检测到 "+jsons.Length+" 个导出文件。");var data=Map(Json().DeserializeObject(File.ReadAllText(jsons[0])));var original=Map(Json().DeserializeObject(File.ReadAllText(jsons[0])));Check(data.ContainsKey("animations")&&Map(data["animations"]).Count>0,"工程没有动画。");
+   status("采样与检查");ConvertData(data,fps);var sk=Map(data["skeleton"]);string imagePath=sk.ContainsKey("images")?Convert.ToString(sk["images"]):"";string media=Path.GetFullPath(Path.Combine(Path.GetDirectoryName(input),imagePath));status("复制贴图");CopyImages(data,media,Path.Combine(stage,"images"));sk["images"]="./images/";
+   string json=Path.Combine(stage,originalName+".json"),project=Path.Combine(stage,Path.GetFileName(input));File.WriteAllText(json,Json().Serialize(data));status("生成可编辑工程");Run(exe,Cli(json,project,"-r"));Check(File.Exists(project)&&new FileInfo(project).Length>0,"Spine 没有生成有效工程。");
+   string verify=Path.Combine(scratch,"verify");Directory.CreateDirectory(verify);status("回读验证");Run(exe,Cli(project,verify,"-e json"));var roundtrip=Map(Json().DeserializeObject(File.ReadAllText(Directory.GetFiles(verify,"*.json").Single())));var ra=Map(roundtrip["animations"]);foreach(var animation in Map(original["animations"])){Check(ra.ContainsKey(animation.Key),"回读后缺失动画。");Check(Math.Abs(Duration(animation.Value)-Duration(ra[animation.Key]))<0.00011,"回读后时长不一致："+animation.Key);}VerifyAnimation(data["animations"],roundtrip["animations"],"animations");
+   Check(before==Hash(input),"原文件在处理期间发生变化，请检查。");File.WriteAllText(Path.Combine(stage,"转换记录.txt"),"Spine Cadence Studio "+Version+"\r\nSpine 4.1.24\r\n目标姿态更新频率："+fps+" FPS\r\n原文件："+input+"\r\n原文件 SHA256："+before+"\r\n回读动画时长检查通过。原文件未覆盖。\r\n事件时间保持原样；时间轴显示 FPS 未修改。\r\nJSON 往返不保证保留编辑器专属元数据。\r\n");Directory.Move(stage,target);status("完成");return target;
+  } finally {if(Directory.Exists(scratch))Directory.Delete(scratch,true);if(Directory.Exists(stage))Directory.Delete(stage,true);}
+ }
+}
+class RoundButton:Button{
+ public bool Primary;
+ public RoundButton(){FlatStyle=FlatStyle.Flat;FlatAppearance.BorderSize=0;Size=new Size(122,36);Margin=new Padding(0,0,8,0);Cursor=Cursors.Hand;}
+ protected override void OnPaint(PaintEventArgs e){e.Graphics.Clear(Parent.BackColor);e.Graphics.SmoothingMode=SmoothingMode.AntiAlias;var r=new Rectangle(1,1,Width-3,Height-3);using(var p=new GraphicsPath()){int d=14;p.AddArc(r.X,r.Y,d,d,180,90);p.AddArc(r.Right-d,r.Y,d,d,270,90);p.AddArc(r.Right-d,r.Bottom-d,d,d,0,90);p.AddArc(r.X,r.Bottom-d,d,d,90,90);p.CloseFigure();using(var b=new SolidBrush(!Enabled?Color.FromArgb(45,48,56):Primary?Color.FromArgb(89,225,237):Color.FromArgb(43,47,64)))e.Graphics.FillPath(b,p);using(var pen=new Pen(Focused?Color.White:Color.FromArgb(105,120,144)))e.Graphics.DrawPath(pen,p);}TextRenderer.DrawText(e.Graphics,Text,Font,ClientRectangle,Enabled?(Primary?Color.FromArgb(20,25,30):Color.White):Color.Gray,TextFormatFlags.HorizontalCenter|TextFormatFlags.VerticalCenter);}
+}
+class StatusProgress:ProgressBar{
+ public Color FillColor=Color.FromArgb(89,225,237);
+ public StatusProgress(){SetStyle(ControlStyles.UserPaint|ControlStyles.OptimizedDoubleBuffer,true);}
+ protected override void OnPaint(PaintEventArgs e){e.Graphics.Clear(Color.FromArgb(40,44,55));using(var b=new SolidBrush(FillColor))e.Graphics.FillRectangle(b,0,0,Width*(Value/(float)Math.Max(1,Maximum)),Height);}
+}
+class MainForm:Form{
+ ListView list=new ListView(); TextBox output=new TextBox(),spine=new TextBox(),log=new TextBox();RadioButton beside=new RadioButton(),custom=new RadioButton();NumericUpDown fps=new NumericUpDown();Label state=new Label();StatusProgress progress=new StatusProgress();RoundButton start,stop;bool busy,cancel;Panel settings;FlowLayoutPanel toolbar;Stopwatch elapsed=new Stopwatch();Timer clock=new Timer();string stage="就绪";int finished,total;
+ public MainForm(string[] paths){Text="Spine Cadence Studio "+Engine.Version+" | 动画降帧";Font=new Font("Microsoft YaHei UI",10);BackColor=Color.FromArgb(17,20,29);ForeColor=Color.FromArgb(237,243,255);ClientSize=new Size(1100,760);MinimumSize=new Size(940,690);AutoScaleMode=AutoScaleMode.Dpi;AllowDrop=true;
+  var layout=new TableLayoutPanel{Dock=DockStyle.Fill,Padding=new Padding(22),ColumnCount=1,RowCount=7};layout.RowStyles.Add(new RowStyle(SizeType.Absolute,58));layout.RowStyles.Add(new RowStyle(SizeType.Absolute,48));layout.RowStyles.Add(new RowStyle(SizeType.Percent,100));layout.RowStyles.Add(new RowStyle(SizeType.Absolute,190));layout.RowStyles.Add(new RowStyle(SizeType.Absolute,88));layout.RowStyles.Add(new RowStyle(SizeType.Absolute,25));layout.RowStyles.Add(new RowStyle(SizeType.Absolute,48));Controls.Add(layout);
+  var title=new Label{Text="Spine Cadence Studio   /   动画降帧",Font=new Font(Font.FontFamily,18,FontStyle.Bold),Dock=DockStyle.Fill,ForeColor=Color.FromArgb(89,225,237),TextAlign=ContentAlignment.MiddleLeft};layout.Controls.Add(title,0,0);
+  toolbar=new FlowLayoutPanel{Dock=DockStyle.Fill};layout.Controls.Add(toolbar,0,1);toolbar.Controls.Add(Button("添加工程…",()=>{using(var d=new OpenFileDialog{Filter="Spine 工程|*.spine",Multiselect=true})if(d.ShowDialog()==DialogResult.OK)Add(d.FileNames);}));toolbar.Controls.Add(Button("添加文件夹…",()=>{using(var d=new FolderBrowserDialog())if(d.ShowDialog()==DialogResult.OK)Add(new[]{d.SelectedPath});}));toolbar.Controls.Add(Button("移除选中",()=>{foreach(ListViewItem item in list.SelectedItems)list.Items.Remove(item);Ready();}));toolbar.Controls.Add(Button("清空列表",()=>{list.Items.Clear();Ready();}));toolbar.Controls.Add(Button("打开输出",()=>{if(list.SelectedItems.Count>0&&list.SelectedItems[0].Tag is string)Open((string)list.SelectedItems[0].Tag);else MessageBox.Show(this,"请选择一个已完成的工程。");}));
+  list.Dock=DockStyle.Fill;list.View=View.Details;list.FullRowSelect=true;list.GridLines=false;list.HideSelection=false;list.BackColor=Color.FromArgb(25,29,40);list.ForeColor=ForeColor;list.ShowItemToolTips=true;list.Columns.Add("工程",210);list.Columns.Add("状态",200);list.Columns.Add("原始路径 / 输出路径",590);list.OwnerDraw=true;list.DrawColumnHeader+=(s,e)=>{using(var brush=new SolidBrush(Color.FromArgb(45,39,56)))e.Graphics.FillRectangle(brush,e.Bounds);TextRenderer.DrawText(e.Graphics,e.Header.Text,Font,e.Bounds,Color.FromArgb(237,157,218),TextFormatFlags.Left|TextFormatFlags.VerticalCenter);};list.DrawItem+=(s,e)=>e.DrawDefault=true;list.DrawSubItem+=(s,e)=>e.DrawDefault=true;layout.Controls.Add(list,0,2);list.DoubleClick+=(s,e)=>{if(list.SelectedItems.Count>0&&list.SelectedItems[0].Tag is string)Open((string)list.SelectedItems[0].Tag);};
+  settings=new Panel{Dock=DockStyle.Fill,Padding=new Padding(0,12,0,0)};layout.Controls.Add(settings,0,3);var grid=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=3,RowCount=4};grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,155));grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,130));for(int i=0;i<4;i++)grid.RowStyles.Add(new RowStyle(SizeType.Absolute,42));settings.Controls.Add(grid);
+  grid.Controls.Add(Label("姿态更新频率"),0,0);var freq=new FlowLayoutPanel{Dock=DockStyle.Fill};fps.Minimum=1;fps.Maximum=120;fps.Value=20;fps.Width=80;freq.Controls.Add(fps);freq.Controls.Add(new Label{Text="FPS",AutoSize=true,Padding=new Padding(5)});grid.Controls.Add(freq,1,0);
+  grid.Controls.Add(Label("输出位置"),0,1);var radios=new FlowLayoutPanel{Dock=DockStyle.Fill};beside.Text="原位置新建目录";beside.AutoSize=true;beside.Checked=true;custom.Text="指定文件夹";custom.AutoSize=true;radios.Controls.Add(beside);radios.Controls.Add(custom);grid.Controls.Add(radios,1,1);output.Dock=DockStyle.Fill;output.Enabled=false;grid.Controls.Add(output,1,2);var browse=Button("选择目录…",()=>{using(var d=new FolderBrowserDialog())if(d.ShowDialog()==DialogResult.OK){output.Text=d.SelectedPath;custom.Checked=true;}});grid.Controls.Add(browse,2,2);custom.CheckedChanged+=(s,e)=>output.Enabled=custom.Checked;
+  grid.Controls.Add(Label("Spine 4.1.24"),0,3);spine.Text=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),"Spine","Spine.com");spine.Dock=DockStyle.Fill;grid.Controls.Add(spine,1,3);grid.Controls.Add(Button("选择程序…",()=>{using(var d=new OpenFileDialog{Filter="Spine 命令行|Spine.com"})if(d.ShowDialog()==DialogResult.OK)spine.Text=d.FileName;}),2,3);
+  log.Multiline=true;log.ReadOnly=true;log.ScrollBars=ScrollBars.Vertical;log.Dock=DockStyle.Fill;log.BackColor=Color.FromArgb(22,25,33);log.ForeColor=Color.FromArgb(190,201,217);layout.Controls.Add(log,0,4);state.Dock=DockStyle.Fill;state.TextAlign=ContentAlignment.MiddleLeft;layout.Controls.Add(state,0,5);var footer=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=3};footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,160));footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,150));progress.Dock=DockStyle.Fill;progress.Margin=new Padding(0,10,20,10);footer.Controls.Add(progress,0,0);stop=Button("完成当前后停止",()=>{cancel=true;stop.Enabled=false;stage="将在当前工程完成后停止";});stop.Width=152;stop.Enabled=false;footer.Controls.Add(stop,1,0);start=Button("开始转换",async()=>await ConvertBatch());start.Primary=true;start.Width=140;footer.Controls.Add(start,2,0);layout.Controls.Add(footer,0,6);
+  DragEnter+=(s,e)=>{if(!busy&&e.Data.GetDataPresent(DataFormats.FileDrop))e.Effect=DragDropEffects.Copy;};DragDrop+=(s,e)=>{if(!busy)Add((string[])e.Data.GetData(DataFormats.FileDrop));};FormClosing+=(s,e)=>{if(busy){e.Cancel=true;MessageBox.Show(this,"请先点击“完成当前后停止”，等待当前工程处理完成。","任务正在运行");}};clock.Interval=500;clock.Tick+=(s,e)=>state.Text=busy?stage+"   ·   "+finished+" / "+total+"   ·   "+elapsed.Elapsed.ToString(@"mm\:ss"):stage;clock.Start();Add(paths);Ready();
+  foreach(var box in new[]{output,spine}){box.BackColor=Color.FromArgb(32,36,48);box.ForeColor=ForeColor;box.BorderStyle=BorderStyle.FixedSingle;}fps.BackColor=Color.FromArgb(32,36,48);fps.ForeColor=ForeColor;
+ }
+ Label Label(string text){return new Label{Text=text,Dock=DockStyle.Fill,TextAlign=ContentAlignment.TopLeft,Padding=new Padding(0,5,0,0)};}
+ RoundButton Button(string text,Action action){var b=new RoundButton{Text=text,AccessibleName=text};b.Click+=(s,e)=>action();return b;}
+ void Open(string folder){if(Directory.Exists(folder))Process.Start("explorer.exe","\""+folder+"\"");}
+ void Ready(){start.Enabled=!busy&&list.Items.Count>0;stage="就绪   ·   "+list.Items.Count+" 个工程";state.Text=stage;}
+ void Add(string[] paths){foreach(string p in paths){try{var files=Directory.Exists(p)?Directory.GetFiles(p,"*.spine",SearchOption.AllDirectories):new[]{p};foreach(string file in files){if(!File.Exists(file)||!file.EndsWith(".spine",StringComparison.OrdinalIgnoreCase))continue;string full=Path.GetFullPath(file);if(list.Items.Cast<ListViewItem>().Any(i=>string.Equals(i.Name,full,StringComparison.OrdinalIgnoreCase)))continue;var item=new ListViewItem(Path.GetFileName(file)){Name=full,ToolTipText=full};item.SubItems.Add("待处理");item.SubItems.Add(full);list.Items.Add(item);}}catch(Exception ex){log.AppendText("添加失败："+ex.Message+Environment.NewLine);}}Ready();}
+ async Task ConvertBatch(){if(custom.Checked&&string.IsNullOrWhiteSpace(output.Text)){MessageBox.Show(this,"请选择输出文件夹。");return;}if(!File.Exists(spine.Text)){MessageBox.Show(this,"请选择已安装并激活的 Spine.com。");return;}busy=true;cancel=false;toolbar.Enabled=false;settings.Enabled=false;start.Enabled=false;stop.Enabled=true;finished=0;total=list.Items.Count;progress.Maximum=Math.Max(1,total);progress.Value=0;elapsed.Restart();int success=0,failed=0;string root=custom.Checked?output.Text:"",exe=spine.Text;int rate=(int)fps.Value;
+  log.Clear();progress.FillColor=Color.FromArgb(89,225,237);state.ForeColor=ForeColor;
+  try{foreach(ListViewItem item in list.Items){if(cancel)break;item.SubItems[1].Text="处理中";item.SubItems[2].Text=item.Name;item.ForeColor=ForeColor;item.Tag=null;try{string result=await Task.Run(()=>Engine.ConvertFile(item.Name,root,rate,exe,msg=>BeginInvoke(new Action(()=>{stage=msg+" · "+item.Text;item.SubItems[1].Text=msg;}))));item.Tag=result;item.SubItems[1].Text="完成";item.SubItems[2].Text=result;item.ForeColor=Color.FromArgb(113,222,172);log.AppendText("完成："+result+Environment.NewLine);success++;}catch(Exception ex){item.SubItems[1].Text="失败";item.ForeColor=Color.FromArgb(247,158,174);log.AppendText(item.Name+Environment.NewLine+ex.Message+Environment.NewLine);failed++;}finished++;progress.Value=finished;progress.FillColor=failed>0?Color.FromArgb(247,110,132):Color.FromArgb(89,225,237);progress.Invalidate();}}
+  finally{busy=false;elapsed.Stop();toolbar.Enabled=true;settings.Enabled=true;start.Enabled=list.Items.Count>0;stop.Enabled=false;progress.FillColor=failed>0?Color.FromArgb(247,110,132):cancel?Color.FromArgb(235,193,104):Color.FromArgb(113,222,172);progress.Invalidate();state.ForeColor=progress.FillColor;stage=(cancel?"已停止":failed>0?(success>0?"部分失败":"转换失败"):"全部完成")+" · 成功 "+success+" · 失败 "+failed+" · 未处理 "+(total-finished)+" · "+elapsed.Elapsed.ToString(@"mm\:ss");state.Text=stage;}
+ }
+}
+static class Program{
+ [STAThread] static int Main(string[] args){try{if(args.Length>0&&args[0]=="--convert"){string result=Engine.ConvertFile(args[1],args[2],int.Parse(args[3]),args[4],s=>Console.WriteLine(s));Console.WriteLine(result);return 0;}Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);Application.Run(new MainForm(args));return 0;}catch(Exception e){if(args.Length>0&&args[0]=="--convert")Console.Error.WriteLine(e.Message);else MessageBox.Show(e.Message,"Spine Cadence Studio");return 1;}}
+}
+}
