@@ -12,4 +12,6 @@ if (!(Test-Path $compiler)) { throw '.NET Framework C# compiler not found.' }
 if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
 Copy-Item -LiteralPath "$repoRoot\src\SpineCadenceStudio.exe.config" -Destination $targetDir
 Copy-Item -LiteralPath "$repoRoot\README.md" -Destination $targetDir
+Copy-Item -LiteralPath "$repoRoot\presets\binary-settings.json", "$repoRoot\presets\screenshot.pack.json" -Destination $targetDir
+Copy-Item -LiteralPath "$repoRoot\CHANGELOG.md" -Destination $targetDir
 Get-FileHash -LiteralPath "$targetDir\SpineCadenceStudio.exe" -Algorithm SHA256
