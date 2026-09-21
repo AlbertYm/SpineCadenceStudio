@@ -1,12 +1,26 @@
 # Spine Cadence Studio 1.0.3
 
-## 本次更新
+将 Spine 动画按指定频率采样，并在采样点之间保持姿态；保留总时长，生成可继续编辑的新工程。
+
+## 获取与构建
+
+本仓库提供源码。安装 Git 后，在 Windows PowerShell 中执行：
+
+```powershell
+git clone https://github.com/AlbertYm/SpineCadenceStudio.git
+cd SpineCadenceStudio
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
+```
+
+构建结果位于 `dist\SpineCadenceStudio_1.0.3`，双击其中的 EXE。构建使用 Windows .NET Framework C# 编译器；不需要 .NET SDK。Spine 必须另行合法安装和激活，本仓库不包含 Spine 安装包或许可证。
+
+修改和上传代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)；自动化代理还应遵守 [AGENTS.md](AGENTS.md)。
+
+## 当前功能
 
 输出文件夹带帧率后缀，但里面的 .spine 和 .json 保留原文件名；两种输出位置均适用。重复转换只对文件夹追加序号。例如 EmojiTY003_20fps\EmojiTY003.spine，下一次为 EmojiTY003_20fps_2\EmojiTY003.spine。
 
-## 延续功能
-
-新增 Spine 4.1 骨骼贝塞尔曲线采样，分别读取每个轴的时间/数值控制点，保持原动作缓入缓出节奏。采样点间保持姿态，动画总时长不变。
+支持 Spine 4.1 骨骼贝塞尔曲线和动态插槽颜色采样，分别读取每个分量的时间/数值控制点，保持原动作缓入缓出节奏。采样点间保持姿态，动画总时长不变。
 批次包含失败时，进度和结果显示为红色；全部成功为绿色；停止为黄色。每次开始清空上一批日志。
 
 ## 使用
@@ -43,6 +57,7 @@ EXE 未签名。单次 Spine 子进程超时为 180 秒，无自动重试。
 
 ## 验证边界
 
-本机结果见验收记录。其他电脑和真实 125%/150% DPI 未重测。窗口绘制检查不等于真实桌面交互验收。
+1.0.3 开发机验证过真实工程的颜色采样、Spine 导入及回读、原文件哈希保护，以及中文和空格路径下的解压运行。其他颜色通道包含合成数据测试。用户素材和测试导出未上传，以上不是仓库 CI 执行结果。
+其他电脑和真实 125%/150% DPI 未验收。窗口绘制检查不等于真实桌面交互验收。公开仓库不等于授予开源许可；本仓库目前未添加开源许可证。
 
 
