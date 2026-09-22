@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Linq;
 using System.Collections;
@@ -11,11 +11,59 @@ using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Security.Cryptography;
 using System.Reflection;
-[assembly: AssemblyVersion("1.1.3.0")]
-[assembly: AssemblyFileVersion("1.1.3.0")]
+[assembly: AssemblyVersion("1.1.4.0")]
+[assembly: AssemblyFileVersion("1.1.4.0")]
 namespace SpineCadence {
+// Spine 4.1: 8-byte hash, variable-length UTF-8 version, then four big-endian floats.
+// https://github.com/EsotericSoftware/spine-runtimes/blob/4.1/spine-csharp/src/SkeletonBinary.cs
+static class SkeletonBounds {
+ internal sealed class Header {
+  public int Offset;
+  public byte[] Bytes;
+  public float[] Values;
+  public string Description { get { return string.Format(System.Globalization.CultureInfo.InvariantCulture,
+   "X={0:R}, Y={1:R}, Width={2:R}, Height={3:R}",Values[0],Values[1],Values[2],Values[3]); } }
+ }
+ internal static Header Read(byte[] bytes) {
+  if(bytes.Length<10)throw new InvalidDataException("骨架二进制文件过短。");
+  int position=8,length=0,shift=0;
+  while(true){
+   if(position>=bytes.Length||shift>=35)throw new InvalidDataException("骨架版本字段损坏。");
+   byte value=bytes[position++];
+   if(shift==28&&(value&0xf8)!=0)throw new InvalidDataException("骨架版本字段超出范围。");
+   length|=(value&127)<<shift;if((value&128)==0)break;shift+=7;
+  }
+  if(length<2||length>64||position>bytes.Length-(length-1)-17)throw new InvalidDataException("骨架文件头不完整。");
+  string version=new System.Text.UTF8Encoding(false,true).GetString(bytes,position,length-1);
+  if(version!="4.1.24")throw new InvalidDataException("包围盒校验仅支持 Spine 4.1.24，实际版本："+version);
+  position+=length-1;var values=new float[4];var raw=new byte[16];Buffer.BlockCopy(bytes,position,raw,0,16);
+  for(int i=0;i<4;i++){
+   var item=new byte[4];Buffer.BlockCopy(raw,i*4,item,0,4);if(BitConverter.IsLittleEndian)Array.Reverse(item);
+   values[i]=BitConverter.ToSingle(item,0);
+   if(float.IsNaN(values[i])||float.IsInfinity(values[i]))throw new InvalidDataException("骨架包围盒包含非法数值。");
+  }
+  if(values[2]<0||values[3]<0)throw new InvalidDataException("骨架包围盒宽高不能为负数。");
+  return new Header{Offset=position,Bytes=raw,Values=values};
+ }
+ internal static Header ReadSource(string file) {
+  var header=Read(File.ReadAllBytes(file));
+  if(header.Values[2]<=0||header.Values[3]<=0)throw new InvalidDataException("源工程经 Spine 导出的包围盒为零，已停止资源导出。请使用降帧前的原工程，或在 Spine 中检查设置姿势与可见附件后保存；不会猜测或填写固定尺寸。");
+  return header;
+ }
+ internal static string Preserve(string file,Header source) {
+  if(source.Values[2]<=0||source.Values[3]<=0)throw new InvalidDataException("无有效源工程包围盒，禁止导出。");
+  byte[] before=File.ReadAllBytes(file);var previous=Read(before);var expected=(byte[])before.Clone();
+  // Only the 16 bytes of bounds are restored. Animation, attachments, atlas and hash stay untouched.
+  Buffer.BlockCopy(source.Bytes,0,expected,previous.Offset,16);
+  if(!before.SequenceEqual(expected))File.WriteAllBytes(file,expected);
+  byte[] actual=File.ReadAllBytes(file);var verified=Read(actual);
+  if(!actual.SequenceEqual(expected)||!verified.Bytes.SequenceEqual(source.Bytes))throw new InvalidDataException("最终 skel 包围盒或其他数据校验失败，未发布资源。");
+  return "源工程真实包围盒："+source.Description+"\r\n转换后二进制原始包围盒："+previous.Description+
+   "\r\n最终 skel 包围盒："+verified.Description+"\r\n已按源工程保留包围盒，最终二进制回读校验通过。\r\n";
+ }
+}
 static class Engine {
- public const string Version="1.1.3";
+ public const string Version="1.1.4";
  static double[] DecodeColor(string hex,int count){Check(hex!=null&&hex.Length==count*2,"颜色格式错误。");return Enumerable.Range(0,count).Select(i=>Convert.ToInt32(hex.Substring(i*2,2),16)/255.0).ToArray();}
  static string EncodeColor(IEnumerable<double> values){return string.Concat(values.Select(v=>((int)Math.Round(Math.Max(0,Math.Min(1,v))*255,MidpointRounding.AwayFromZero)).ToString("x2")));}
  static double[] ColorValues(Dictionary<string,object> key,string type){if(type=="alpha")return new[]{Num(key,"value")};bool two=type.EndsWith("2");int n=type.StartsWith("rgba")?4:3;var light=DecodeColor(Convert.ToString(key[two?"light":"color"]),n);return two?light.Concat(DecodeColor(Convert.ToString(key["dark"]),3)).ToArray():light;}
@@ -93,11 +141,31 @@ foreach(var pair in d){if(path.Contains("/deform/")&&(pair.Key=="vertices"||pair
   string originalName=Path.GetFileNameWithoutExtension(input),stem=originalName+"_"+fps+"fps",target=Path.Combine(root,stem);int suffix=2;while(Directory.Exists(target)||File.Exists(target))target=Path.Combine(root,stem+"_"+suffix++);
   string stage=Path.Combine(root,".SpineCadence_"+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(stage);
   string resourceStage=null,resourceTarget=null;bool published=false,resourcePublished=false;
+  string boundsRecord="";SkeletonBounds.Header sourceBounds=null;
+  string binaryConfig=Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"binary-settings.json");
   try{status("读取工程");Run(exe,Cli(input,export,"-e json"));var jsons=Directory.GetFiles(export,"*.json");Check(jsons.Length==1,"当前版本仅支持单骨架工程，检测到 "+jsons.Length+" 个导出文件。");var data=Map(Json().DeserializeObject(File.ReadAllText(jsons[0])));var original=Map(Json().DeserializeObject(File.ReadAllText(jsons[0])));Check(data.ContainsKey("animations")&&Map(data["animations"]).Count>0,"工程没有动画。");
+   if(exportBundle){
+    Check(File.Exists(binaryConfig),"缺少 binary-settings.json。");
+    status("读取源工程真实包围盒");string sourceExport=Path.Combine(scratch,"source-binary");Directory.CreateDirectory(sourceExport);
+    Run(exe,Cli(input,sourceExport,"-e "+Q(binaryConfig)));var binaries=Directory.GetFiles(sourceExport,"*.skel");
+    Check(binaries.Length==1,"源工程包围盒读取失败：必须生成一个 skel。");sourceBounds=SkeletonBounds.ReadSource(binaries[0]);
+    var sourceMeta=Map(original["skeleton"]);string[] boundNames={"x","y","width","height"};
+    for(int i=0;i<4;i++)Check(Math.Abs(Num(sourceMeta,boundNames[i])-sourceBounds.Values[i])<=Math.Max(0.011,Math.Abs(sourceBounds.Values[i])*0.000001),"源工程 JSON 与二进制包围盒不一致，已停止导出。");
+    status("源工程包围盒："+sourceBounds.Description);
+   }
    status("采样与检查");ConvertData(data,fps);var sk=Map(data["skeleton"]);string imagePath=sk.ContainsKey("images")?Convert.ToString(sk["images"]):"";string media=Path.GetFullPath(Path.Combine(Path.GetDirectoryName(input),imagePath));status("复制贴图");CopyImages(data,media,Path.Combine(stage,"images"));sk["images"]="./images/";
    string json=Path.Combine(stage,originalName+".json"),project=Path.Combine(stage,Path.GetFileName(input));File.WriteAllText(json,Json().Serialize(data));status("生成可编辑工程");Run(exe,Cli(json,project,"-r"));Check(File.Exists(project)&&new FileInfo(project).Length>0,"Spine 没有生成有效工程。");
    string verify=Path.Combine(scratch,"verify");Directory.CreateDirectory(verify);status("回读验证");Run(exe,Cli(project,verify,"-e json"));var roundtrip=Map(Json().DeserializeObject(File.ReadAllText(Directory.GetFiles(verify,"*.json").Single())));var ra=Map(roundtrip["animations"]);foreach(var animation in Map(original["animations"])){Check(ra.ContainsKey(animation.Key),"回读后缺失动画。");Check(Math.Abs(Duration(animation.Value)-Duration(ra[animation.Key]))<0.00011,"回读后时长不一致："+animation.Key);}VerifyAnimation(data["animations"],roundtrip["animations"],"animations");
-   Check(before==Hash(input),"原文件在处理期间发生变化，请检查。");if(exportBundle){status("导出 skel、atlas 和 PNG");string exportStage=Path.Combine(scratch,"bundle");Directory.CreateDirectory(exportStage);string config=Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"binary-settings.json");string pack=string.IsNullOrEmpty(packPreset)?Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"screenshot.pack.json"):packPreset;Check(File.Exists(config)&&File.Exists(pack),"缺少导出或打包设置文件。");Run(exe,Cli(project,exportStage,"-e "+Q(config)));Run(exe,"--hide-license -u 4.1.24 -i "+Q(Path.Combine(stage,"images"))+" -j "+Q(project)+" -o "+Q(exportStage)+" -n "+Q(originalName)+" -p "+Q(pack));var bundleFiles=Directory.GetFiles(exportStage,"*",SearchOption.TopDirectoryOnly);Check(bundleFiles.Any(f=>f.EndsWith(".skel",StringComparison.OrdinalIgnoreCase)),"未生成 .skel 文件。");Check(bundleFiles.Any(f=>f.EndsWith(".atlas",StringComparison.OrdinalIgnoreCase)),"未生成 .atlas 文件。");Check(bundleFiles.Any(f=>f.EndsWith(".png",StringComparison.OrdinalIgnoreCase)),"未生成打包 PNG。");string destination;if(string.IsNullOrWhiteSpace(resourceRoot)){destination=Path.Combine(stage,"游戏资源");Directory.CreateDirectory(destination);}else{string resourceBase=Path.GetFullPath(resourceRoot);Directory.CreateDirectory(resourceBase);resourceTarget=Path.Combine(resourceBase,originalName);int sequence=2;while(Directory.Exists(resourceTarget)||File.Exists(resourceTarget))resourceTarget=Path.Combine(resourceBase,originalName+"_"+sequence++);resourceStage=Path.Combine(resourceBase,".SpineCadence_"+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(resourceStage);destination=resourceStage;}foreach(string file in bundleFiles){Check(new[]{".skel",".atlas",".png"}.Contains(Path.GetExtension(file).ToLowerInvariant()),"导出产生了未预期的文件类型。");File.Copy(file,Path.Combine(destination,Path.GetFileName(file)),false);}}File.WriteAllText(Path.Combine(stage,"转换记录.txt"),"Spine Cadence Studio "+Version+"\r\nSpine 4.1.24\r\n目标姿态更新频率："+fps+" FPS\r\n原文件："+input+"\r\n原文件 SHA256："+before+"\r\n回读动画时长检查通过。原文件未覆盖。\r\n事件时间保持原样；时间轴显示 FPS 未修改。\r\nJSON 往返不保证保留编辑器专属元数据。\r\n");if(resourceStage!=null){Directory.Move(resourceStage,resourceTarget);resourcePublished=true;}Directory.Move(stage,target);published=true;if(exportBundle)File.AppendAllText(Path.Combine(target,"转换记录.txt"),"资源目录："+(resourceTarget??Path.Combine(target,"游戏资源"))+Environment.NewLine);status("完成");return target;
+   if(exportBundle){
+    // Sampling changes animation timelines only. Reusing source bounds requires identical setup data.
+    foreach(var section in original){if(section.Key=="skeleton"||section.Key=="animations")continue;
+     Check(roundtrip.ContainsKey(section.Key),"回读后设置姿势缺失："+section.Key);
+     VerifyAnimation(section.Value,roundtrip[section.Key],"setup/"+section.Key);
+     VerifyAnimation(roundtrip[section.Key],section.Value,"setup/"+section.Key);
+    }
+    Check(!roundtrip.Keys.Except(original.Keys).Any(),"回读后设置姿势结构发生变化，无法安全保留源工程包围盒。");
+   }
+   Check(before==Hash(input),"原文件在处理期间发生变化，请检查。");if(exportBundle){status("导出 skel、atlas 和 PNG");string exportStage=Path.Combine(scratch,"bundle");Directory.CreateDirectory(exportStage);string config=binaryConfig;string pack=string.IsNullOrEmpty(packPreset)?Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"screenshot.pack.json"):packPreset;Check(File.Exists(config)&&File.Exists(pack),"缺少导出或打包设置文件。");Run(exe,Cli(project,exportStage,"-e "+Q(config)));Run(exe,"--hide-license -u 4.1.24 -i "+Q(Path.Combine(stage,"images"))+" -j "+Q(project)+" -o "+Q(exportStage)+" -n "+Q(originalName)+" -p "+Q(pack));var bundleFiles=Directory.GetFiles(exportStage,"*",SearchOption.TopDirectoryOnly);Check(bundleFiles.Any(f=>f.EndsWith(".skel",StringComparison.OrdinalIgnoreCase)),"未生成 .skel 文件。");Check(bundleFiles.Any(f=>f.EndsWith(".atlas",StringComparison.OrdinalIgnoreCase)),"未生成 .atlas 文件。");Check(bundleFiles.Any(f=>f.EndsWith(".png",StringComparison.OrdinalIgnoreCase)),"未生成打包 PNG。");var finalSkeletons=bundleFiles.Where(f=>f.EndsWith(".skel",StringComparison.OrdinalIgnoreCase)).ToArray();Check(finalSkeletons.Length==1,"最终导出必须只有一个骨架。");status("校验最终 skel 真实包围盒");boundsRecord=SkeletonBounds.Preserve(finalSkeletons[0],sourceBounds);Check(before==Hash(input),"导出期间源工程发生变化，未发布资源。");status("最终包围盒已验证："+sourceBounds.Description);string destination;if(string.IsNullOrWhiteSpace(resourceRoot)){destination=Path.Combine(stage,"游戏资源");Directory.CreateDirectory(destination);}else{string resourceBase=Path.GetFullPath(resourceRoot);Directory.CreateDirectory(resourceBase);resourceTarget=Path.Combine(resourceBase,originalName);int sequence=2;while(Directory.Exists(resourceTarget)||File.Exists(resourceTarget))resourceTarget=Path.Combine(resourceBase,originalName+"_"+sequence++);resourceStage=Path.Combine(resourceBase,".SpineCadence_"+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(resourceStage);destination=resourceStage;}foreach(string file in bundleFiles){Check(new[]{".skel",".atlas",".png"}.Contains(Path.GetExtension(file).ToLowerInvariant()),"导出产生了未预期的文件类型。");File.Copy(file,Path.Combine(destination,Path.GetFileName(file)),false);}}File.WriteAllText(Path.Combine(stage,"转换记录.txt"),"Spine Cadence Studio "+Version+"\r\nSpine 4.1.24\r\n目标姿态更新频率："+fps+" FPS\r\n原文件："+input+"\r\n原文件 SHA256："+before+"\r\n回读动画时长检查通过。原文件未覆盖。\r\n事件时间保持原样；时间轴显示 FPS 未修改。\r\nJSON 往返不保证保留编辑器专属元数据。\r\n");if(exportBundle)File.AppendAllText(Path.Combine(stage,"转换记录.txt"),boundsRecord);if(resourceStage!=null){Directory.Move(resourceStage,resourceTarget);resourcePublished=true;}Directory.Move(stage,target);published=true;if(exportBundle)File.AppendAllText(Path.Combine(target,"转换记录.txt"),"资源目录："+(resourceTarget??Path.Combine(target,"游戏资源"))+Environment.NewLine);status("完成");return target;
   } finally {if(resourceStage!=null&&Directory.Exists(resourceStage))Directory.Delete(resourceStage,true);if(!published&&resourcePublished&&Directory.Exists(resourceTarget))Directory.Delete(resourceTarget,true);if(Directory.Exists(scratch))Directory.Delete(scratch,true);if(Directory.Exists(stage))Directory.Delete(stage,true);}
  }
 }
